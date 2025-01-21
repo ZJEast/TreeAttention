@@ -15,18 +15,16 @@ class TreeModel(nn.Module):
         self.depth = depth
         self.q_dim = q_dim
         self.v_dim = v_dim
-        self.key = nn.Parameter(torch.randn((1, int(2**depth) - 1, 2, q_dim)), requires_grad=True)
-        self.value = nn.Parameter(torch.randn((1, int(2**depth), v_dim)), requires_grad=True)
+        self.key = nn.Parameter(torch.randn((int(2**depth) - 1, 2, q_dim)), requires_grad=True)
+        self.value = nn.Parameter(torch.randn((int(2**depth), v_dim)), requires_grad=True)
     
     def forward(self, query: Tensor):
         B, _ = query.shape
         assert query.shape == (B, self.q_dim)
 
-        key = self.key.expand(B, -1, -1, -1)
-        value = self.value.expand(B, -1, -1)
-        t = tree.Tree(self.depth, key, value)
+        _id = torch.zeros((B,), device=query.device, dtype=torch.long)
 
-        return tree.op_tree_attention(query, t)
+        return tree.op_tree_attention(query, _id, _id, self.depth, self.key, self.value)
 
 
 class Coder(nn.Module):
@@ -41,7 +39,7 @@ class Coder(nn.Module):
     
     def decode(self, x: Tensor):
         x = torch.bernoulli(x.sigmoid())
-        return x.long()
+        return x.bool()
     
     def check(self):
         data = self.abs.data
@@ -52,7 +50,7 @@ class RandomTreeModel:
 
     def __init__(self, t: TreeModel):
         self.template = t
-        self.weights = torch.tensor([1, 5, 5, 5]).log()
+        self.weights = torch.tensor([1, 3, 3, 10]).log()
         self.inf = 1000.0
     
     def sample_tree(self):
@@ -80,7 +78,7 @@ class RandomTreeModel:
         t1 = self.template
         B = batch_size
         query = torch.full((B, t1.q_dim), 0.5)
-        query = torch.bernoulli(query).long()
+        query = torch.bernoulli(query).bool()
 
         query = query.to(t1.key.device)
         return query
@@ -92,7 +90,7 @@ def target_loss(support: Tensor, value: Tensor, target: Tensor):
     assert value.shape == (B, D)
     assert target.shape == (B, D)
 
-    _support = - (- (2 * target.float() - 1) * value).logsumexp(dim=-1)
+    _support = tree.op_equal(value, target)
     _support = tree.op_and(_support, support)
     _support = tree.op_or(_support, - support)
 
