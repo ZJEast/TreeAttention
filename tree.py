@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from tkinter import NO
 import torch
 from torch import nn
 
@@ -28,12 +29,18 @@ def op_match(query: Tensor, key: Tensor):
     return _support.view(B)
 
 
-def op_tree_attention(query: Tensor, k_id: Tensor, v_id: Tensor, depth: int, key: Tensor, value: Tensor):
+def op_tree_attention(query: Tensor, depth: int, key: Tensor, value: Tensor, k_id: Tensor=None, v_id: Tensor=None):
 
     B, q_dim = query.shape
     v_dim = value.shape[-1]
     k_num = int(2**depth) - 1
     v_num = int(2**depth)
+
+    if k_id is None:
+        k_id = torch.zeros((B,), device=query.device, dtype=torch.long)
+    if v_id is None:
+        v_id = torch.zeros((B,), device=query.device, dtype=torch.long)
+
 
     assert depth > 0
     assert k_id.shape == (B,) and k_id.dtype == torch.long

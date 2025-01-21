@@ -22,9 +22,7 @@ class TreeModel(nn.Module):
         B, _ = query.shape
         assert query.shape == (B, self.q_dim)
 
-        _id = torch.zeros((B,), device=query.device, dtype=torch.long)
-
-        return tree.op_tree_attention(query, _id, _id, self.depth, self.key, self.value)
+        return tree.op_tree_attention(query, self.depth, self.key, self.value)
 
 
 class Coder(nn.Module):
