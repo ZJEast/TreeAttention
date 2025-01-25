@@ -216,4 +216,4 @@ class TreeLayer(nn.Module):
         support = support.view(B, H)
         support = - (- support).logsumexp(dim=-1)
 
-        return support.view(B), value
+        return support.view(B), value.view(B, H, -1)
