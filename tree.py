@@ -90,9 +90,9 @@ def tree_attention(
     v_num = int(2**depth)
 
     if k_id is None:
-        k_id = torch.zeros((B,), device=query.device, dtype=torch.long)
+        k_id = torch.zeros((1,), device=query.device, dtype=torch.long).expand(B)
     if v_id is None:
-        v_id = torch.zeros((B,), device=query.device, dtype=torch.long)
+        v_id = torch.zeros((1,), device=query.device, dtype=torch.long).expand(B)
 
 
     assert depth > 0
@@ -191,20 +191,20 @@ class Coder(nn.Module):
 
 class TreeLayer(nn.Module):
     
-    def __init__(self, depth, in_dim, out_dim, n_heads, bias=0):
+    def __init__(self, depth, q_dim, v_dim, n_heads, bias=5.0):
         nn.Module.__init__(self)
         self.depth = depth
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+        self.q_dim = q_dim
+        self.v_dim = v_dim
         self.n_heads = n_heads
 
         _2depth = int(2**depth)
-        self.key = nn.Parameter(bias + torch.randn(n_heads, _2depth - 1, 2, in_dim), requires_grad=True)
-        self.value = nn.Parameter(torch.randn(n_heads, _2depth, out_dim), requires_grad=True)
+        self.key = nn.Parameter(bias + torch.randn(n_heads, _2depth - 1, 2, q_dim), requires_grad=True)
+        self.value = nn.Parameter(torch.randn(n_heads, _2depth, v_dim), requires_grad=True)
     
     def forward(self, query: Tensor, random=True):
         B, D = query.shape
-        assert query.shape == (B, self.in_dim)
+        assert query.shape == (B, self.q_dim)
         H = self.n_heads
 
         query = query.view(B, 1, D).expand(B, H, D).reshape(-1, D)
