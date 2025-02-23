@@ -1,5 +1,9 @@
 # 二叉树神经网络
 
+乱码可以看html版本的README
+
+https://htmlpreview.github.io/?https://github.com/ZJEast/TreeAttention/blob/main/README.html
+
 作者：张俊东
 
 联系方式：13016606412（手机微信），510481609@qq.com，zhangjd26@mail2.sysu.edu.cn
