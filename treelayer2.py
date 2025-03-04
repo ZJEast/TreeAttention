@@ -11,30 +11,35 @@ class BaseModule(nn.Module):
 
     def __init__(self):
         nn.Module.__init__(self)
-        self.params_bound = None
-        self.params_pairs: List[nn.Parameter] = []
         
     def build(self):
         return self
     
-    def params_pairs_register(self, w_0: nn.Parameter, w_1: nn.Parameter):
-        assert w_0.shape == w_1.shape
-        self.params_pairs.append([w_0, w_1])
+    def params_pairs_register(self, w: nn.Parameter, params_bound = None):
+        assert w.shape[0] == 2
+        w.requires_params_pairs_norm = True
+        w.params_bound = params_bound
     
-    def params_pairs_norm(self):
+    @classmethod
+    def params_pairs_norm(cls, w: nn.Parameter):
+        if not hasattr(w, "requires_params_pairs_norm"):
+            return
         with torch.no_grad():
-            for w_0, w_1 in self.params_pairs:
-                w_0_ = w_0 - (w_0 + w_1) / 2
-                w_1_ = w_1 - (w_0 + w_1) / 2
-                if self.params_bound is not None:
-                    w_0_ = w_0_.clamp_min_(self.params_bound)
-                    w_1_ = w_1_.clamp_max_(-self.params_bound)
-                w_0.data = w_0_.detach()
-                w_1.data = w_1_.detach()
+            w_0, w_1 = w[0], w[1]
+            w_0_ = w_0 - (w_0 + w_1) / 2
+            w_1_ = w_1 - (w_0 + w_1) / 2
+            if w.params_bound is not None:
+                w_0_ = w_0_.clamp_min_(w.params_bound)
+                w_1_ = w_1_.clamp_max_(-w.params_bound)
+            w_0.data = w_0_.detach()
+            w_1.data = w_1_.detach()
     
-    def params_pairs_forward(self, w_0: nn.Parameter, w_1: nn.Parameter):
-        w_0 = w_0 - torch.logaddexp(w_0, w_1)
-        w_1 = w_1 - torch.logaddexp(w_0, w_1)
+    @classmethod
+    def log_softmax(cls, w: nn.Parameter):
+        w_0, w_1 = w[0], w[1]
+        w_ = torch.logaddexp(w_0, w_1)
+        w_0 = w_0 - w_
+        w_1 = w_1 - w_
         return w_0, w_1
 
 
@@ -43,7 +48,6 @@ class Coder(BaseModule):
     def __init__(self):
         BaseModule.__init__(self)
         self.n_bit = 8
-        self.params_bound = 50.0
 
     def build(self):
         mul = torch.arange(self.n_bit)
@@ -51,9 +55,8 @@ class Coder(BaseModule):
         mul = (2 ** mul).long()
         self.mul = nn.Parameter(mul.view(1, -1), requires_grad=False)
 
-        self.w_0 = nn.Parameter(torch.tensor(self.params_bound), requires_grad=True)
-        self.w_1 = nn.Parameter(torch.tensor(-self.params_bound), requires_grad=True)
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.w = nn.Parameter(torch.tensor([50.0, -50.0]), requires_grad=True)
+        self.params_pairs_register(self.w)
 
         return self
     
@@ -75,7 +78,7 @@ class Coder(BaseModule):
 
     def bool2float(self, x: Tensor):
         assert x.dtype == torch.bool
-        w_0, w_1 = self.params_pairs_forward(self.w_0, self.w_1)
+        w_0, w_1 = self.log_softmax(self.w)
         x_0 = torch.where(x, w_0, w_1)
         x_1 = torch.where(~x, w_0, w_1)
         return x_0, x_1
@@ -99,9 +102,8 @@ class DenyLayer(BaseModule):
         self.y_dim = 1
     
     def build(self):
-        self.w_0 = nn.Parameter(torch.randn((self.y_dim, )), requires_grad=True)
-        self.w_1 = nn.Parameter(torch.randn((self.y_dim, )), requires_grad=True)
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.w = nn.Parameter(torch.randn((2, self.y_dim, )), requires_grad=True)
+        self.params_pairs_register(self.w)
         return self
     
     def forward(self, x_0: Tensor, x_1: Tensor):
@@ -109,7 +111,7 @@ class DenyLayer(BaseModule):
         Y = self.y_dim
         assert X == Y
 
-        w_0, w_1 = self.params_pairs_forward(self.w_0, self.w_1)
+        w_0, w_1 = self.log_softmax(self.w)
         w_0 = w_0.view(1, Y)
         w_1 = w_1.view(1, Y)
         y_0 = torch.logaddexp(w_0 + x_0, w_1 + x_1)
@@ -158,15 +160,11 @@ class ShuffleLayer(BaseModule):
         self.n_bit = n_bit
         X = int(2**self.n_bit)
 
-        self.w_0 = nn.Parameter(
-            torch.randn((self.y_dim, n_bit)),
+        self.w = nn.Parameter(
+            torch.randn((2, self.y_dim, n_bit)),
             requires_grad=True
         )
-        self.w_1 = nn.Parameter(
-            torch.randn((self.y_dim, n_bit)),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.params_pairs_register(self.w)
         
         coder = Coder()
         coder.n_bit = self.n_bit
@@ -192,7 +190,7 @@ class ShuffleLayer(BaseModule):
         assert x_0.shape == x_1.shape
         Y = self.y_dim
 
-        w_0, w_1 = self.params_pairs_forward(self.w_0, self.w_1) # Y, bit
+        w_0, w_1 = self.log_softmax(self.w) # Y, bit
         y_0 = torch.einsum("yb,xb->yx", w_0, self.b_0)
         y_1 = torch.einsum("yb,xb->yx", w_1, self.b_1)
         y = self.shorter.forward(y_0 + y_1)
@@ -217,15 +215,11 @@ class CompareLayer(BaseModule):
         self.y_dim = 128
     
     def build(self):
-        self.w_0 = nn.Parameter(
-            torch.randn((1, self.y_dim, self.x_dim)),
+        self.w = nn.Parameter(
+            torch.randn((2, 1, self.y_dim, self.x_dim)),
             requires_grad=True
         )
-        self.w_1 = nn.Parameter(
-            torch.randn((1, self.y_dim, self.x_dim)),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.params_pairs_register(self.w)
         return self
     
     def forward(self, x_0: Tensor, x_1: Tensor, coder: Coder):
@@ -233,15 +227,14 @@ class CompareLayer(BaseModule):
         assert X == self.x_dim
         assert Y == self.y_dim
 
-        w1, w2 = coder.w_0, coder.w_1
-        w1, w2 = coder.params_pairs_forward(w1, w2)
+        w1, w2 = coder.log_softmax(coder.w)
         w1: Tensor = w1
         w2: Tensor  = w2 - np.log(2)
         s1: Tensor = w2.view(1, 1).expand(B, Y)
         s2: Tensor = w1.view(1, 1).expand(B, Y)
         s3: Tensor = w2.view(1, 1).expand(B, Y)
 
-        w_0, w_1 = coder.params_pairs_forward(self.w_0, self.w_1)
+        w_0, w_1 = coder.log_softmax(self.w)
 
         for i in range(X):
             x10 = x_0[:, :, i]
@@ -268,15 +261,11 @@ class ValueLayer(BaseModule):
         self.y_dim = 4
     
     def build(self):
-        self.w_0 = nn.Parameter(
-            torch.randn((1, self.x_dim, self.y_dim)),
+        self.w = nn.Parameter(
+            torch.randn((2, 1, self.x_dim, self.y_dim)),
             requires_grad=True
         )
-        self.w_1 = nn.Parameter(
-            torch.randn((1, self.x_dim, self.y_dim)),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.params_pairs_register(self.w)
         return self
     
     def forward(self, x: Tensor):
@@ -284,7 +273,7 @@ class ValueLayer(BaseModule):
         assert X == self.x_dim
         Y = self.y_dim
 
-        v_0, v_1 = self.params_pairs_forward(self.w_0, self.w_1)
+        v_0, v_1 = self.log_softmax(self.w)
         y_0 = x.view(B, X, 1) + v_0.view(1, X, Y)
         y_0 = y_0.logsumexp(1).view(B, Y)
         y_1 = x.view(B, X, 1) + v_1.view(1, X, Y)
@@ -364,15 +353,11 @@ class ChannelTree(BaseModule):
         self.n_bit = 4
     
     def build(self):
-        self.w_0 = nn.Parameter(
-            torch.randn((self.n_channel, self.n_bit)),
+        self.w = nn.Parameter(
+            torch.randn((2, self.n_channel, self.n_bit)),
             requires_grad=True
         )
-        self.w_1 = nn.Parameter(
-            torch.randn((self.n_channel, self.n_bit)),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.w_0, self.w_1)
+        self.params_pairs_register(self.w)
 
         self.tree.build()
 
@@ -384,7 +369,7 @@ class ChannelTree(BaseModule):
         C = self.n_channel
         D = self.n_bit
 
-        w_0, w_1 = self.params_pairs_forward(self.w_0, self.w_1)
+        w_0, w_1 = self.log_softmax(self.w)
         x_0 = x_0.view(B, 1, X).expand(B, C, X).reshape(B, C, X)
         x_1 = x_1.view(B, 1, X).expand(B, C, X).reshape(B, C, X)
         w_0 = w_0.view(1, C, D).expand(B, C, D).reshape(B, C, D)
@@ -482,3 +467,7 @@ class WorkingMemory(BaseModule):
             v_1.view(B, 1, C) + attn.view(B, A, 1))
         
         return m_0, m_1
+
+
+class TuringMachine(BaseModule):
+    pass
