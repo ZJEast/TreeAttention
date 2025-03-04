@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 from torch import nn, Tensor
-from torch.distributions import Categorical
+from torch.nn import functional as F
 from typing import List
 
 
@@ -404,11 +404,81 @@ class ChannelTree(BaseModule):
         return v_0.view(B, -1), v_1.view(B, -1)
 
 
-class WorkingMemory:
+"""
+模拟工作记忆
+"""
+class WorkingMemory(BaseModule):
 
-    @classmethod
-    def init_memory(cls, m0: Tensor, coder: Coder):
+    def __init__(self):
+        BaseModule.__init__(self)
+        self.coder = Coder()
+        self.shorter = ShorterLayer()
+    
+    def build(self):
+        self.coder.build()
+        
+        A = int(2**self.coder.n_bit)
+        b = self.coder.long2bool(torch.arange(A)).long()
+        self.b_0 = nn.Parameter(b.float(), requires_grad=False)
+        self.b_1 = nn.Parameter((~b).float(), requires_grad=False)
+
+        return self
+    
+    def create_memory(self, m0: Tensor):
         assert m0.dtype == torch.bool
         B, A, C = m0.shape
-        m_0, m_1 = coder.bool2float(m0)
+        assert self.shorter.y_dim == A
+        m_0, m_1 = self.coder.bool2float(m0)
+        return m_0, m_1
+    
+    def read(self, m_0: Tensor, m_1: Tensor, a_0: Tensor, a_1: Tensor):
+        B, A, C = m_0.shape
+        assert m_0.shape == m_1.shape
+        assert self.shorter.y_dim == A
+
+        B, D = a_0.shape
+        assert a_0.shape == a_1.shape
+        assert D == self.coder.n_bit
+
+        attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
+        attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
+        attn = self.shorter.forward(attn)
+
+        m_0 = attn.view(B, A, 1) + m_0
+        m_0 = m_0.logsumexp(dim=1)
+        m_1 = attn.view(B, A, 1) + m_1
+        m_1 = m_1.logsumexp(dim=1)
+
+        return m_0, m_1
+
+    def write(self, 
+            m_0: Tensor, m_1: Tensor, 
+            a_0: Tensor, a_1: Tensor, 
+            v_0: Tensor, v_1: Tensor):
+        B, A, C = m_0.shape
+        assert m_0.shape == m_1.shape
+        assert self.shorter.y_dim == A
+
+        B, D = a_0.shape
+        assert a_0.shape == a_1.shape
+        assert D == self.coder.n_bit
+
+        attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
+        attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
+        attn = self.shorter.forward(attn)
+
+        nattn1 = attn[:, :-1].logcumsumexp(1)
+        nattn1 = F.pad(nattn1, (1, 0), "constant", -torch.inf)
+        nattn2 = attn[:, 1:].flip([1]).logcumsumexp(1).flip([1])
+        nattn2 = F.pad(nattn2, (0, 1), "constant", -torch.inf)
+
+        nattn = torch.logaddexp(nattn1, nattn2)
+
+        m_0 = torch.logaddexp(
+            m_0 + nattn.view(B, A, 1), 
+            v_0.view(B, 1, C) + attn.view(B, A, 1))
+        m_1 = torch.logaddexp(
+            m_1 + nattn.view(B, A, 1), 
+            v_1.view(B, 1, C) + attn.view(B, A, 1))
+        
         return m_0, m_1
