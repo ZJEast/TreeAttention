@@ -89,7 +89,8 @@ class Coder(BaseModule):
         x = torch.bernoulli(x_0.exp())
         return x.bool()
     
-    def BCELoss(self, y_0: Tensor, y_1: Tensor, target: Tensor):
+    @classmethod
+    def BCELoss(cls, y_0: Tensor, y_1: Tensor, target: Tensor):
         loss = torch.where(target, y_0, y_1)
         loss = - loss.mean()
         return loss
