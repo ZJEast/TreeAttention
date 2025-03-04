@@ -45,6 +45,8 @@ class BaseModule(nn.Module):
 
 class Coder(BaseModule):
 
+    BOUND = 50.0
+
     def __init__(self):
         BaseModule.__init__(self)
         self.n_bit = 8
@@ -55,8 +57,8 @@ class Coder(BaseModule):
         mul = (2 ** mul).long()
         self.mul = nn.Parameter(mul.view(1, -1), requires_grad=False)
 
-        self.w = nn.Parameter(torch.tensor([50.0, -50.0]), requires_grad=True)
-        self.params_pairs_register(self.w)
+        self.w = nn.Parameter(torch.tensor([Coder.BOUND, -Coder.BOUND]), requires_grad=True)
+        self.params_pairs_register(self.w, Coder.BOUND)
 
         return self
     
