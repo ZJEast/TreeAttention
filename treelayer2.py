@@ -215,6 +215,7 @@ class CompareLayer(BaseModule):
         BaseModule.__init__(self)
         self.x_dim = 8
         self.y_dim = 128
+        self.coder = Coder()
     
     def build(self):
         self.w = nn.Parameter(
@@ -222,12 +223,14 @@ class CompareLayer(BaseModule):
             requires_grad=True
         )
         self.params_pairs_register(self.w)
+        self.coder.build()
         return self
     
-    def forward(self, x_0: Tensor, x_1: Tensor, coder: Coder):
+    def forward(self, x_0: Tensor, x_1: Tensor):
         B, Y, X = x_0.shape
         assert X == self.x_dim
         assert Y == self.y_dim
+        coder = self.coder
 
         w1, w2 = coder.log_softmax(coder.w)
         w1: Tensor = w1
@@ -322,7 +325,7 @@ class TreeLayer(nn.Module):
 
         return self
     
-    def forward(self, x_0: Tensor, x_1: Tensor, coder: Coder):
+    def forward(self, x_0: Tensor, x_1: Tensor):
         B, X = x_0.shape
         assert X == self.x_dim
 
@@ -335,7 +338,7 @@ class TreeLayer(nn.Module):
             z_0, z_1 = shuffle.forward(x_0, x_1)
             z_0 = z_0.view(B, n, self.shuffle_dim)
             z_1 = z_1.view(B, n, self.shuffle_dim)
-            attn1, attn2 = compare.forward(z_0, z_1, coder)
+            attn1, attn2 = compare.forward(z_0, z_1)
             attn = torch.cat([attn + attn1, attn + attn2], dim=-1)
         
         y_0, y_1 = self.value_layer.forward(attn)
@@ -381,12 +384,12 @@ class ChannelTree(BaseModule):
 
         return q_0, q_1
 
-    def forward(self, x_0: Tensor, x_1: Tensor, coder: Coder):
+    def forward(self, x_0: Tensor, x_1: Tensor):
         B, X = x_0.shape
         assert x_0.shape == x_1.shape
 
         q_0, q_1 = self.get_query(x_0, x_1)
-        v_0, v_1 = self.tree.forward(q_0, q_1, coder)
+        v_0, v_1 = self.tree.forward(q_0, q_1)
 
         return v_0.view(B, -1), v_1.view(B, -1)
 
