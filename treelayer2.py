@@ -49,11 +49,11 @@ class Coder(BaseModule):
 
     def __init__(self):
         BaseModule.__init__(self)
-        self.n_bit = 8
+        self.n_bits = 8
 
     def build(self):
-        mul = torch.arange(self.n_bit)
-        mul = self.n_bit - 1 - mul
+        mul = torch.arange(self.n_bits)
+        mul = self.n_bits - 1 - mul
         mul = (2 ** mul).long()
         self.mul = nn.Parameter(mul.view(1, -1), requires_grad=False)
 
@@ -65,7 +65,7 @@ class Coder(BaseModule):
     def bool2long(self, x: Tensor):
         shape = x.shape
         assert x.dtype == torch.bool
-        x = x.view(-1, self.n_bit)
+        x = x.view(-1, self.n_bits)
         x = (x * self.mul).sum(dim=-1)
         x = x.view(shape[:-1])
         return x
@@ -75,7 +75,7 @@ class Coder(BaseModule):
         assert x.dtype == torch.long
         x = x.view(-1, 1)
         x = (x // self.mul) % 2
-        x = x.view(shape + (self.n_bit, ))
+        x = x.view(shape + (self.n_bits, ))
         return x.bool()
 
     def bool2float(self, x: Tensor):
@@ -158,19 +158,19 @@ class ShuffleLayer(BaseModule):
         self.use_deny = True
     
     def build(self):
-        n_bit = np.ceil(np.log(self.x_dim) / np.log(2))
-        n_bit = int(n_bit)
-        self.n_bit = n_bit
-        X = int(2**self.n_bit)
+        n_bits = np.ceil(np.log(self.x_dim) / np.log(2))
+        n_bits = int(n_bits)
+        self.n_bits = n_bits
+        X = int(2**self.n_bits)
 
         self.w = nn.Parameter(
-            torch.randn((2, self.y_dim, n_bit)),
+            torch.randn((2, self.y_dim, n_bits)),
             requires_grad=True
         )
         self.params_pairs_register(self.w)
         
         coder = Coder()
-        coder.n_bit = self.n_bit
+        coder.n_bits = self.n_bits
         coder.build()
 
         b = coder.long2bool(torch.arange(X)).long()
@@ -356,11 +356,11 @@ class ChannelTree(BaseModule):
         BaseModule.__init__(self)
         self.tree = TreeLayer()
         self.n_channel = 4
-        self.n_bit = 4
+        self.n_bits = 4
     
     def build(self):
         self.w = nn.Parameter(
-            torch.randn((2, self.n_channel, self.n_bit)),
+            torch.randn((2, self.n_channel, self.n_bits)),
             requires_grad=True
         )
         self.params_pairs_register(self.w)
@@ -373,7 +373,7 @@ class ChannelTree(BaseModule):
         B, X = x_0.shape
         assert x_0.shape == x_1.shape
         C = self.n_channel
-        D = self.n_bit
+        D = self.n_bits
 
         w_0, w_1 = self.log_softmax(self.w)
         x_0 = x_0.view(B, 1, X).expand(B, C, X).reshape(B, C, X)
@@ -391,8 +391,9 @@ class ChannelTree(BaseModule):
 
         q_0, q_1 = self.get_query(x_0, x_1)
         v_0, v_1 = self.tree.forward(q_0, q_1)
+        v_0, v_1 = v_0.view(B, -1), v_1.view(B, -1)
 
-        return v_0.view(B, -1), v_1.view(B, -1)
+        return v_0, v_1
 
 
 """
@@ -404,11 +405,12 @@ class WorkingMemory(BaseModule):
         BaseModule.__init__(self)
         self.coder = Coder()
         self.shorter = ShorterLayer()
+        self.n_bits = 4
     
     def build(self):
         self.coder.build()
         
-        A = int(2**self.coder.n_bit)
+        A = int(2**self.coder.n_bits)
         b = self.coder.long2bool(torch.arange(A)).long()
         self.b_0 = nn.Parameter(b.float(), requires_grad=False)
         self.b_1 = nn.Parameter((~b).float(), requires_grad=False)
@@ -418,6 +420,7 @@ class WorkingMemory(BaseModule):
     def create_memory(self, m0: Tensor):
         assert m0.dtype == torch.bool
         B, A, C = m0.shape
+        assert C == self.n_bits
         assert self.shorter.y_dim == A
         m_0, m_1 = self.coder.bool2float(m0)
         return m_0, m_1
@@ -429,7 +432,7 @@ class WorkingMemory(BaseModule):
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
-        assert D == self.coder.n_bit
+        assert D == self.coder.n_bits
 
         attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
         attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
@@ -452,7 +455,7 @@ class WorkingMemory(BaseModule):
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
-        assert D == self.coder.n_bit
+        assert D == self.coder.n_bits
 
         attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
         attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
@@ -476,4 +479,57 @@ class WorkingMemory(BaseModule):
 
 
 class TuringMachine(BaseModule):
-    pass
+    
+    def __init__(self):
+        BaseModule.__init__(self)
+        self.tree = ChannelTree()
+        self.rw_memory = WorkingMemory()
+        self.r_memory = WorkingMemory()
+        self.n_r_head0 = 4 # rw_memory
+        self.n_r_head1 = 4 # r_memory
+        self.n_w_head = 4
+        self.state_dim = 4
+    
+    def build(self):
+        tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_bits + \
+            self.n_r_head0 * self.rw_memory.n_bits + \
+            self.n_r_head1 * self.r_memory.n_bits + \
+            self.tree.n_bits
+        self.tree.tree.x_dim = tree_in
+        tree_out = self.tree.tree.y_dim * self.tree.n_bits
+
+        self.tree.build()
+        self.rw_memory.build()
+        self.r_memory.build()
+
+        self.state_head = ShuffleLayer()
+        self.state_head.x_dim = tree_out
+        self.state_head.y_dim = self.state_dim
+        self.state_head.build()
+
+        r_head0 = []
+        for i in range(self.n_r_head0):
+            head = ShuffleLayer()
+            head.x_dim = tree_out
+            head.y_dim = self.rw_memory.coder.n_bits
+            r_head0.append(head.build())
+        self.r_head0 = nn.ModuleList(r_head0)
+
+        r_head1 = []
+        for i in range(self.n_r_head1):
+            head = ShuffleLayer()
+            head.x_dim = tree_out
+            head.y_dim = self.r_memory.coder.n_bits
+            r_head1.append(head.build())
+        self.r_head1 = nn.ModuleList(r_head1)
+        
+        w_head = []
+        for i in range(self.n_w_head):
+            head = ShuffleLayer()
+            head.x_dim = tree_out
+            head.y_dim = self.rw_memory.coder.n_bits
+            w_head.append(head.build())
+        self.w_head = nn.ModuleList(w_head)
+    
+    def forward(self, r_memory: Tensor):
+        pass
