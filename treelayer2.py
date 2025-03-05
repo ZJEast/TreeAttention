@@ -125,10 +125,10 @@ class DenyLayer(BaseModule):
 """
 将太长的注意力缩短
 """
-class ShorterLayer(nn.Module):
+class ShorterLayer(BaseModule):
 
     def __init__(self):
-        nn.Module.__init__(self)
+        BaseModule.__init__(self)
         self.y_dim = 3
     
     def build(self):
@@ -147,6 +147,31 @@ class ShorterLayer(nn.Module):
         return y
 
 """
+将地址转为注意力
+"""
+class AddressLayer(nn.Module):
+
+    def __init__(self):
+        nn.Module.__init__(self)
+        self.n_bits = 3
+    
+    def build(self):
+        coder = Coder()
+        coder.n_bits = self.n_bits
+        coder.build()
+
+        b = coder.long2bool(torch.arange(int(2**self.n_bits))).long()
+        self.b_0 = nn.Parameter(b.float(), requires_grad=False)
+        self.b_1 = nn.Parameter((~b).float(), requires_grad=False)
+
+        return self
+    
+    def forward(self, a_0: Tensor, a_1: Tensor):
+        attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
+        attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
+        return attn
+
+"""
 对特征进行重排序
 """
 class ShuffleLayer(BaseModule):
@@ -161,7 +186,6 @@ class ShuffleLayer(BaseModule):
         n_bits = np.ceil(np.log(self.x_dim) / np.log(2))
         n_bits = int(n_bits)
         self.n_bits = n_bits
-        X = int(2**self.n_bits)
 
         self.w = nn.Parameter(
             torch.randn((2, self.y_dim, n_bits)),
@@ -173,9 +197,9 @@ class ShuffleLayer(BaseModule):
         coder.n_bits = self.n_bits
         coder.build()
 
-        b = coder.long2bool(torch.arange(X)).long()
-        self.b_0 = nn.Parameter(b.float(), requires_grad=False)
-        self.b_1 = nn.Parameter((~b).float(), requires_grad=False)
+        self.address = AddressLayer()
+        self.address.n_bits = self.n_bits
+        self.address.build()
 
         self.shorter = ShorterLayer()
         self.shorter.y_dim = self.x_dim
@@ -194,9 +218,8 @@ class ShuffleLayer(BaseModule):
         Y = self.y_dim
 
         w_0, w_1 = self.log_softmax(self.w) # Y, bit
-        y_0 = torch.einsum("yb,xb->yx", w_0, self.b_0)
-        y_1 = torch.einsum("yb,xb->yx", w_1, self.b_1)
-        y = self.shorter.forward(y_0 + y_1)
+        y = self.address.forward(w_0, w_1)
+        y = self.shorter.forward(y)
         y_0 = y.view(1, Y, X) + x_0.view(B, 1, X)
         y_0 = y_0.logsumexp(dim=2)
         y_1 = y.view(1, Y, X) + x_1.view(B, 1, X)
@@ -403,27 +426,17 @@ class WorkingMemory(BaseModule):
 
     def __init__(self):
         BaseModule.__init__(self)
-        self.coder = Coder()
         self.shorter = ShorterLayer()
-        self.n_bits = 4
+        self.n_char_bits = 4
+        self.n_address_bits = 4
     
     def build(self):
-        self.coder.build()
         
-        A = int(2**self.coder.n_bits)
-        b = self.coder.long2bool(torch.arange(A)).long()
-        self.b_0 = nn.Parameter(b.float(), requires_grad=False)
-        self.b_1 = nn.Parameter((~b).float(), requires_grad=False)
+        self.adress = AddressLayer()
+        self.adress.n_bits = self.n_address_bits
+        self.adress.build()
 
         return self
-    
-    def create_memory(self, m0: Tensor):
-        assert m0.dtype == torch.bool
-        B, A, C = m0.shape
-        assert C == self.n_bits
-        assert self.shorter.y_dim == A
-        m_0, m_1 = self.coder.bool2float(m0)
-        return m_0, m_1
     
     def read(self, m_0: Tensor, m_1: Tensor, a_0: Tensor, a_1: Tensor):
         B, A, C = m_0.shape
@@ -432,10 +445,9 @@ class WorkingMemory(BaseModule):
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
-        assert D == self.coder.n_bits
+        assert D == self.n_address_bits
 
-        attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
-        attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
+        attn = self.adress.forward(a_0, a_1)
         attn = self.shorter.forward(attn)
 
         m_0 = attn.view(B, A, 1) + m_0
@@ -455,10 +467,9 @@ class WorkingMemory(BaseModule):
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
-        assert D == self.coder.n_bits
+        assert D == self.n_address_bits
 
-        attn = torch.einsum("bd,ad->ba", a_0, self.b_0)
-        attn += torch.einsum("bd,ad->ba", a_1, self.b_1)
+        attn = self.adress.forward(a_0, a_1)
         attn = self.shorter.forward(attn)
 
         nattn1 = attn[:, :-1].logcumsumexp(1)
@@ -477,7 +488,32 @@ class WorkingMemory(BaseModule):
         
         return m_0, m_1
 
+"""
+将词转为向量
+"""
+class EmbeddingLayer(BaseModule):
 
+    def __init__(self):
+        BaseModule.__init__(self)
+        self.n_token = 128
+        self.n_bits = 4
+    
+    def build(self):
+        self.w = nn.Parameter(torch.randn((2, self.n_token, self.n_bits)), requires_grad=True)
+        self.params_pairs_register(self.w)
+        return self
+    
+    def forward(self, x: Tensor):
+        assert x.dtype == torch.long
+        w_0, w_1 = self.log_softmax(self.w)
+        x_0 = w_0.index_select(0, x.view(-1))
+        x_1 = w_1.index_select(0, x.view(-1))
+        shape = x.shape + (self.n_bits, )
+        return x_0.view(shape), x_1.view(shape)
+
+"""
+图灵机模型
+"""
 class TuringMachine(BaseModule):
     
     def __init__(self):
@@ -491,9 +527,9 @@ class TuringMachine(BaseModule):
         self.state_dim = 4
     
     def build(self):
-        tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_bits + \
-            self.n_r_head0 * self.rw_memory.n_bits + \
-            self.n_r_head1 * self.r_memory.n_bits + \
+        tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_char_bits + \
+            self.n_r_head0 * self.rw_memory.n_char_bits + \
+            self.n_r_head1 * self.r_memory.n_char_bits + \
             self.tree.n_bits
         self.tree.tree.x_dim = tree_in
         tree_out = self.tree.tree.y_dim * self.tree.n_bits
@@ -511,7 +547,7 @@ class TuringMachine(BaseModule):
         for i in range(self.n_r_head0):
             head = ShuffleLayer()
             head.x_dim = tree_out
-            head.y_dim = self.rw_memory.coder.n_bits
+            head.y_dim = self.rw_memory.n_address_bits
             r_head0.append(head.build())
         self.r_head0 = nn.ModuleList(r_head0)
 
@@ -519,7 +555,7 @@ class TuringMachine(BaseModule):
         for i in range(self.n_r_head1):
             head = ShuffleLayer()
             head.x_dim = tree_out
-            head.y_dim = self.r_memory.coder.n_bits
+            head.y_dim = self.r_memory.n_address_bits
             r_head1.append(head.build())
         self.r_head1 = nn.ModuleList(r_head1)
         
@@ -527,9 +563,9 @@ class TuringMachine(BaseModule):
         for i in range(self.n_w_head):
             head = ShuffleLayer()
             head.x_dim = tree_out
-            head.y_dim = self.rw_memory.coder.n_bits
+            head.y_dim = self.rw_memory.n_address_bits
             w_head.append(head.build())
         self.w_head = nn.ModuleList(w_head)
     
-    def forward(self, r_memory: Tensor):
+    def forward(self, m_0: Tensor, m_1: Tensor):
         pass
