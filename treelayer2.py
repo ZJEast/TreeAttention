@@ -439,9 +439,13 @@ class WorkingMemory(BaseModule):
         return self
     
     def read(self, m_0: Tensor, m_1: Tensor, a_0: Tensor, a_1: Tensor):
+        A = self.shorter.y_dim
+        C = self.n_char_bits
+        m_0 = m_0.view(-1, A, C)
+        m_1 = m_1.view(-1, A, C)
         B, A, C = m_0.shape
-        assert m_0.shape == m_1.shape
         assert self.shorter.y_dim == A
+        assert self.n_char_bits == C
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
@@ -461,9 +465,13 @@ class WorkingMemory(BaseModule):
             m_0: Tensor, m_1: Tensor, 
             a_0: Tensor, a_1: Tensor, 
             v_0: Tensor, v_1: Tensor):
+        A = self.shorter.y_dim
+        C = self.n_char_bits
+        m_0 = m_0.view(-1, A, C)
+        m_1 = m_1.view(-1, A, C)
         B, A, C = m_0.shape
-        assert m_0.shape == m_1.shape
         assert self.shorter.y_dim == A
+        assert self.n_char_bits == C
 
         B, D = a_0.shape
         assert a_0.shape == a_1.shape
@@ -525,6 +533,7 @@ class TuringMachine(BaseModule):
         self.n_r_head1 = 4 # r_memory
         self.n_w_head = 4
         self.state_dim = 4
+        self.n_loop = 4
     
     def build(self):
         tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_char_bits + \
@@ -566,6 +575,101 @@ class TuringMachine(BaseModule):
             head.y_dim = self.rw_memory.n_address_bits
             w_head.append(head.build())
         self.w_head = nn.ModuleList(w_head)
+        
+        v_head = []
+        for i in range(self.n_w_head):
+            head = ShuffleLayer()
+            head.x_dim = tree_out
+            head.y_dim = self.rw_memory.n_char_bits
+            v_head.append(head.build())
+        self.v_head = nn.ModuleList(v_head)
+
+        self.rw_memory0 = nn.Parameter(
+            torch.randn(2, 1, self.rw_memory.shorter.y_dim, self.rw_memory.n_char_bits),
+            requires_grad=True
+        )
+        self.params_pairs_register(self.rw_memory0)
+
+        self.state0 = nn.Parameter(
+            torch.randn(2, self.state_dim),
+            requires_grad=True
+        )
+        self.params_pairs_register(self.state0)
+        
+        self.r_ptr0 = nn.Parameter(
+            torch.randn(2, self.n_r_head0, self.rw_memory.n_address_bits),
+            requires_grad=True
+        )
+        self.params_pairs_register(self.r_ptr0)
+        
+        self.r_ptr1 = nn.Parameter(
+            torch.randn(2, self.n_r_head1, self.r_memory.n_address_bits),
+            requires_grad=True
+        )
+        self.params_pairs_register(self.r_ptr1)
     
-    def forward(self, m_0: Tensor, m_1: Tensor):
-        pass
+    def forward(self, rm_0: Tensor, rm_1: Tensor):
+        B, L, A, C = rm_0.shape
+        assert rm_0.shape == rm_1.shape
+        assert self.r_memory.shorter.y_dim == A
+        assert self.r_memory.n_char_bits == C
+
+        rwm_0, rwm_1 = self.log_softmax(self.rw_memory0)
+        rwm_0 = rwm_0.expand(B, -1, -1).reshape(B, -1, -1)
+        rwm_1 = rwm_1.expand(B, -1, -1).reshape(B, -1, -1)
+
+        r_ptr0_0, r_ptr0_1 = self.log_softmax(self.r_ptr0)
+        r_ptr0_0 = [r_ptr0_0[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head0)]
+        r_ptr0_1 = [r_ptr0_1[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head1)]
+        
+        r_ptr1_0, r_ptr1_1 = self.log_softmax(self.r_ptr1)
+        r_ptr1_0 = [r_ptr1_0[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head0)]
+        r_ptr1_1 = [r_ptr1_1[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head1)]
+
+        state_0, state_1 = self.log_softmax(self.state0)
+        state_0 = state_0.view(1, -1).expand(B, -1)
+        state_1 = state_1.view(1, -1).expand(B, -1)
+
+        out_0 = [rwm_0]
+        out_1 = [rwm_1]
+
+        for i in range(L):
+            rm_0_ = rm_0[:, i, :, :]
+            rm_1_ = rm_1[:, i, :, :]
+            for j in range(self.n_loop):
+                q_0 = [state_0]
+                q_1 = [state_1]
+                for k in range(self.n_r_head0):
+                    v_0, v_1 = self.rw_memory.read(rm_0_, rm_1_, r_ptr0_0[k], r_ptr0_1[k])
+                    q_0.append(v_0)
+                    q_1.append(v_1)
+                for k in range(self.n_r_head1):
+                    v_0, v_1 = self.r_memory.read(rm_0_, rm_1_, r_ptr1_0[k], r_ptr1_1[k])
+                    q_0.append(v_0)
+                    q_1.append(v_1)
+
+                q_0 = torch.cat(q_0, dim=-1)
+                q_1 = torch.cat(q_1, dim=-1)
+                v_0, v_1 = self.tree.forward(q_0, q_1)
+
+                for k in range(self.n_w_head):
+                    w_head: ShuffleLayer = self.w_head[k]
+                    a_0, a_1 = w_head.forward(v_0, v_1)
+                    v_head: ShuffleLayer = self.v_head[k]
+                    wv_0, wv_1 = v_head.forward(v_0, v_1)
+                    rwm_0, rwm_1 = self.rw_memory.write(rwm_0, rwm_1, a_0, a_1, wv_0, wv_1)
+                
+                for k in range(self.n_r_head0):
+                    head: ShuffleLayer = self.r_head0[k]
+                    r_ptr0_0[k], r_ptr0_1[k] = head.forward(v_0, v_1)
+                
+                for k in range(self.n_r_head1):
+                    head: ShuffleLayer = self.r_head1[k]
+                    r_ptr1_0[k], r_ptr1_1[k] = head.forward(v_0, v_1)
+
+                state_0, state_1 = self.state_head.forward(v_0, v_1)
+            
+            out_0.append(rwm_0)
+            out_1.append(rwm_1)
+        
+        return out_0, out_1
