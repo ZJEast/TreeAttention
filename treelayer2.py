@@ -534,6 +534,7 @@ class TuringMachine(BaseModule):
         self.n_w_head = 4
         self.state_dim = 4
         self.n_loop = 4
+        self.out_dim = 4
     
     def build(self):
         tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_char_bits + \
@@ -607,6 +608,11 @@ class TuringMachine(BaseModule):
             requires_grad=True
         )
         self.params_pairs_register(self.r_ptr1)
+        
+        self.out_head = ShuffleLayer()
+        self.out_head.x_dim = self.rw_memory.shorter.y_dim * self.rw_memory.n_char_bits
+        self.out_head.y_dim = self.out_dim
+        self.out_head.build()
     
     def forward(self, rm_0: Tensor, rm_1: Tensor):
         B, L, A, C = rm_0.shape
@@ -639,10 +645,12 @@ class TuringMachine(BaseModule):
             for j in range(self.n_loop):
                 q_0 = [state_0]
                 q_1 = [state_1]
+
                 for k in range(self.n_r_head0):
                     v_0, v_1 = self.rw_memory.read(rm_0_, rm_1_, r_ptr0_0[k], r_ptr0_1[k])
                     q_0.append(v_0)
                     q_1.append(v_1)
+                    
                 for k in range(self.n_r_head1):
                     v_0, v_1 = self.r_memory.read(rm_0_, rm_1_, r_ptr1_0[k], r_ptr1_1[k])
                     q_0.append(v_0)
@@ -669,7 +677,9 @@ class TuringMachine(BaseModule):
 
                 state_0, state_1 = self.state_head.forward(v_0, v_1)
             
-            out_0.append(rwm_0)
-            out_1.append(rwm_1)
+            _d = self.out_head.x_dim
+            _out_0, _out_1 = self.out_head.forward(rwm_0.view(-1, _d), rwm_1.view(-1, _d))
+            out_0.append(_out_0)
+            out_1.append(_out_1)
         
         return out_0, out_1
