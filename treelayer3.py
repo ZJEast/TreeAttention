@@ -519,167 +519,89 @@ class EmbeddingLayer(BaseModule):
         shape = x.shape + (self.n_bits, )
         return x_0.view(shape), x_1.view(shape)
 
+
 """
-图灵机模型
+读写头注意力机制
 """
-class TuringMachine(BaseModule):
-    
+class AttentionLayer(BaseModule):
+
     def __init__(self):
         BaseModule.__init__(self)
-        self.tree = ChannelTree()
-        self.rw_memory = WorkingMemory()
-        self.r_memory = WorkingMemory()
-        self.n_r_head0 = 4 # rw_memory
-        self.n_r_head1 = 4 # r_memory
-        self.n_w_head = 4
-        self.state_dim = 4
-        self.n_loop = 4
-        self.out_dim = 4
-
+        self.x_dim = 16
+        self.q_dim = 4
+        self.k_dim = 4
+        self.v_dim = 4
+        
     def build(self):
-        tree_in = self.state_dim + self.n_r_head0 * self.rw_memory.n_char_bits + \
-            self.n_r_head0 * self.rw_memory.n_char_bits + \
-            self.n_r_head1 * self.r_memory.n_char_bits + \
-            self.tree.n_bits
-        self.tree.tree.x_dim = tree_in
-        tree_out = self.tree.tree.y_dim * self.tree.n_bits
+        self.q_head = ShuffleLayer()
+        self.q_head.x_dim = self.x_dim
+        self.q_head.y_dim = self.q_dim
+        self.q_head.build()
+        
+        self.k_head = ShuffleLayer()
+        self.k_head.x_dim = self.x_dim
+        self.k_head.y_dim = self.k_dim
+        self.k_head.build()
+        
+        self.v_head = ShuffleLayer()
+        self.v_head.x_dim = self.x_dim
+        self.v_head.y_dim = self.v_dim
+        self.v_head.build()
+        
+        self.w = nn.Parameter(torch.tensor([Coder.BOUND, -Coder.BOUND]), requires_grad=True)
+        self.params_pairs_register(self.w, Coder.BOUND)
+        
+        self.miss = nn.Parameter(torch.randn((2, self.v_dim)), requires_grad=True)
+        self.params_pairs_register(self.miss)
 
-        self.tree.build()
-        self.rw_memory.build()
-        self.r_memory.build()
+        return self
+    
+    def forward(self, x_0: Tensor, x_1: Tensor):
+        B, L, X = x_0.shape
 
-        self.state_head = ShuffleLayer()
-        self.state_head.x_dim = tree_out
-        self.state_head.y_dim = self.state_dim
-        self.state_head.build()
+        x_0 = x_0.view(-1, X)
+        x_1 = x_1.view(-1, X)
 
-        r_head0 = []
-        for i in range(self.n_r_head0):
-            head = ShuffleLayer()
-            head.x_dim = tree_out
-            head.y_dim = self.rw_memory.n_address_bits
-            r_head0.append(head.build())
-        self.r_head0 = nn.ModuleList(r_head0)
+        q_0, q_1 = self.q_head.forward(x_0, x_1)
+        k_0, k_1 = self.k_head.forward(x_0, x_1)
+        v_0, v_1 = self.v_head.forward(x_0, x_1)
 
-        r_head1 = []
-        for i in range(self.n_r_head1):
-            head = ShuffleLayer()
-            head.x_dim = tree_out
-            head.y_dim = self.r_memory.n_address_bits
-            r_head1.append(head.build())
-        self.r_head1 = nn.ModuleList(r_head1)
+        q_0, q_1 = q_0.view(B, L, 1, -1), q_1.view(B, L, 1, -1)
+        k_0, k_1 = k_0.view(B, 1, L, -1), k_1.view(B, 1, L, -1)
+        eq = torch.logaddexp(q_0 + k_0, q_1 + k_1).view(-1, X)
+        neq = torch.logaddexp(q_1 + k_0, q_0 + k_1).view(-1, X)
 
-        w_head = []
-        for i in range(self.n_w_head):
-            head = ShuffleLayer()
-            head.x_dim = tree_out
-            head.y_dim = self.rw_memory.n_address_bits
-            w_head.append(head.build())
-        self.w_head = nn.ModuleList(w_head)
+        _eq = eq.cumsum(dim=-1)
+        eq = _eq[:, -1]
+        _neq = F.pad(_eq[:, :-1], (1, 0), "const", 0.0)
+        _neq = (_neq + neq).logsumexp(-1)
+        eq, neq = _eq.view(B, L, L), _neq.view(B, L, L)
+        
+        w_0, w_1 = self.log_softmax(self.w)
+        mask = torch.ones((1, L, L), device=eq.device)
+        mask = torch.triu(mask, diagonal=1).bool()
+        m_0 = torch.where(mask, w_0, w_1)
+        m_1 = torch.where(~mask, w_0, w_1)
 
-        v_head = []
-        for i in range(self.n_w_head):
-            head = ShuffleLayer()
-            head.x_dim = tree_out
-            head.y_dim = self.rw_memory.n_char_bits
-            v_head.append(head.build())
-        self.v_head = nn.ModuleList(v_head)
+        """
+        eq m -> 0
+        neq m -> 0
+        eq nm -> 1
+        neq nm -> 0
+        """
 
-        self.rw_memory0 = nn.Parameter(
-            torch.randn(2, 1, self.rw_memory.shorter.y_dim, self.rw_memory.n_char_bits),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.rw_memory0)
+        eq, neq = eq + m_1, torch.logaddexp(neq, eq + m_0)
+        _neq = neq.flip([-1]).cumsum(-1).flip([-1])
+        _eq = F.pad(_eq, (1, 0), "const", 0.0)
+        _neq = F.pad(_neq, (0, 1), "const", 0.0)
+        attn = _eq + _neq
 
-        self.state0 = nn.Parameter(
-            torch.randn(2, self.state_dim),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.state0)
+        miss_0, miss_1 = self.log_softmax(self.miss)
+        attn1 = attn[:, :, 0]
+        attn2 = attn[:, :, 1:]
+        o_0 = (attn2.view(B, L, L, 1) + v_0.view(B, 1, L, -1)).logsumexp(2)
+        o_1 = (attn2.view(B, L, L, 1) + v_1.view(B, 1, L, -1)).logsumexp(2)
+        o_0 = torch.logaddexp(o_0, attn1.view(B, L, 1) + miss_0.view(1, 1, -1))
+        o_1 = torch.logaddexp(o_1, attn1.view(B, L, 1) + miss_1.view(1, 1, -1))
 
-        self.r_ptr0 = nn.Parameter(
-            torch.randn(2, self.n_r_head0, self.rw_memory.n_address_bits),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.r_ptr0)
-
-        self.r_ptr1 = nn.Parameter(
-            torch.randn(2, self.n_r_head1, self.r_memory.n_address_bits),
-            requires_grad=True
-        )
-        self.params_pairs_register(self.r_ptr1)
-
-        self.out_head = ShuffleLayer()
-        self.out_head.x_dim = self.rw_memory.shorter.y_dim * self.rw_memory.n_char_bits
-        self.out_head.y_dim = self.out_dim
-        self.out_head.build()
-
-    def forward(self, rm_0: Tensor, rm_1: Tensor):
-        B, L, A, C = rm_0.shape
-        assert rm_0.shape == rm_1.shape
-        assert self.r_memory.shorter.y_dim == A
-        assert self.r_memory.n_char_bits == C
-
-        rwm_0, rwm_1 = self.log_softmax(self.rw_memory0)
-        rwm_0 = rwm_0.expand(B, -1, -1).reshape(B, -1, -1)
-        rwm_1 = rwm_1.expand(B, -1, -1).reshape(B, -1, -1)
-
-        r_ptr0_0, r_ptr0_1 = self.log_softmax(self.r_ptr0)
-        r_ptr0_0 = [r_ptr0_0[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head0)]
-        r_ptr0_1 = [r_ptr0_1[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head1)]
-
-        r_ptr1_0, r_ptr1_1 = self.log_softmax(self.r_ptr1)
-        r_ptr1_0 = [r_ptr1_0[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head0)]
-        r_ptr1_1 = [r_ptr1_1[i].view(1, -1).expand(B, -1) for i in range(self.n_r_head1)]
-
-        state_0, state_1 = self.log_softmax(self.state0)
-        state_0 = state_0.view(1, -1).expand(B, -1)
-        state_1 = state_1.view(1, -1).expand(B, -1)
-
-        out_0 = [rwm_0]
-        out_1 = [rwm_1]
-
-        for i in range(L):
-            rm_0_ = rm_0[:, i, :, :]
-            rm_1_ = rm_1[:, i, :, :]
-            for j in range(self.n_loop):
-                q_0 = [state_0]
-                q_1 = [state_1]
-
-                for k in range(self.n_r_head0):
-                    v_0, v_1 = self.rw_memory.read(rm_0_, rm_1_, r_ptr0_0[k], r_ptr0_1[k])
-                    q_0.append(v_0)
-                    q_1.append(v_1)
-
-                for k in range(self.n_r_head1):
-                    v_0, v_1 = self.r_memory.read(rm_0_, rm_1_, r_ptr1_0[k], r_ptr1_1[k])
-                    q_0.append(v_0)
-                    q_1.append(v_1)
-
-                q_0 = torch.cat(q_0, dim=-1)
-                q_1 = torch.cat(q_1, dim=-1)
-                v_0, v_1 = self.tree.forward(q_0, q_1)
-
-                for k in range(self.n_w_head):
-                    w_head: ShuffleLayer = self.w_head[k]
-                    a_0, a_1 = w_head.forward(v_0, v_1)
-                    v_head: ShuffleLayer = self.v_head[k]
-                    wv_0, wv_1 = v_head.forward(v_0, v_1)
-                    rwm_0, rwm_1 = self.rw_memory.write(rwm_0, rwm_1, a_0, a_1, wv_0, wv_1)
-
-                for k in range(self.n_r_head0):
-                    head: ShuffleLayer = self.r_head0[k]
-                    r_ptr0_0[k], r_ptr0_1[k] = head.forward(v_0, v_1)
-
-                for k in range(self.n_r_head1):
-                    head: ShuffleLayer = self.r_head1[k]
-                    r_ptr1_0[k], r_ptr1_1[k] = head.forward(v_0, v_1)
-
-                state_0, state_1 = self.state_head.forward(v_0, v_1)
-
-            _d = self.out_head.x_dim
-            _out_0, _out_1 = self.out_head.forward(rwm_0.view(-1, _d), rwm_1.view(-1, _d))
-            out_0.append(_out_0)
-            out_1.append(_out_1)
-
-        return out_0, out_1
+        return o_0, o_1
